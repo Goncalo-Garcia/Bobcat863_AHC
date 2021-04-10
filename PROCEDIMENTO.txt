@@ -1,0 +1,3 @@
+1º Calibrar
+2º Testar individualmente o código do LIFT e só depois o TILT
+3º Testar individualmente o código do PID lib no LIFT e tentar correr o auto calibration
