@@ -10,10 +10,14 @@
 #define ON  HIGH
 #define OFF LOW
 
+#define SAFETY_BAR         ON    // Enables the code that checks if the safety bar is ON or OFF
+#define SAFETY_DEBOUNCE    100    // (100ms) Debounce time
+#define SAFETY_TIMEOUT     5000   // (5s) 5 seconds window that disables safety feature
+
 #define EEPROM_DUMP OFF    // This outputs the values stored on the eeprom memory
 
 #define PLOTTE_TILT OFF    // This enables the serial code to plot the graph of the feedback signal
-#define PLOTTE_LIFT ON     // This enables the serial code to plot the graph of the feedback signal
+#define PLOTTE_LIFT OFF    // This enables the serial code to plot the graph of the feedback signal
 
 #define SERIAL_TILT OFF    // This enables the serial code to set the PID values kp, ki, kd
 #define SERIAL_LIFT OFF    // This enables the serial code to set the PID values kp, ki, kd
@@ -23,8 +27,8 @@
 
 #define SAMPLE_TIME       30 // Sample time between pid computations
 
-#define HANDLE_MID_TH     5  // Middle point threshold
-#define FDBACK_MID_TH     10  // Middle point threshold
+#define HANDLE_MID_TH     0    // Middle point threshold
+#define FDBACK_MID_TH     0   // Middle point threshold
 
 // EEPROM REGISTERS ADDRESS
 //--------------------------------------------------------------------------------------------------------
@@ -109,6 +113,18 @@ enum
   CONTRL_TOTAL
 };
 
+// SAFETY BAR DEFINES
+//-------------------------------------------------------------
+#define AUX_INPIN               3       // Pin of aux switch
+#define AUX_OUTPORT             PORTB   // Port of aux valve
+#define AUX_OUTDIR              DDRB    // Dir of aux valve
+#define AUX_OUTPIN              PINB0   // Pin of aux valve
+
+// SAFETY BAR DEFINES
+//-------------------------------------------------------------
+#define SAFETY_PIN               2     // Pin of Right Handle potentiometer 
+#define SAFETY_INPUT             PIND // Port of right actuator pins 
+
 // LIFT ACTUATOR DEFINES
 //-------------------------------------------------------------
 #define HANDLE_L                 A0    // Pin of Right Handle potentiometer
@@ -133,19 +149,27 @@ enum
 
 //-------------------------------------------------------------
 
-// Variaveis para os controladores PID
+// Variaveis para o safety bar pin
+volatile uint8_t  Safety_State     = OFF;
+volatile uint32_t Safety_Reference = 0; 
+
+// Variaveis para o auxiliar
+volatile uint8_t  Aux_State     = OFF;
+volatile uint32_t Aux_Reference = 0; 
+
+// Variaveis pa7ra os controladores PID
 double Tilt_SetPoint, Tilt_FeedBack, Tilt_OutPut;
 double Lift_SetPoint, Lift_FeedBack, Lift_OutPut;
 
-//PID tunings for TILT
+// PID tunings for TILT
 double TILT_KP = 0.4;
-double TILT_KI = 0.1;
+double TILT_KI = 0.05;
 double TILT_KD = 0.01;
 
-//PID tunings for LIFT
-double LIFT_KP = 0.4;
+// PID tunings for LIFT
+double LIFT_KP = 0.65;
 double LIFT_KI = 0.1;
-double LIFT_KD = 0.01;
+double LIFT_KD = 0.02;
 
 // Controladores PID
 PID tilt_PID(&Tilt_FeedBack, &Tilt_OutPut, &Tilt_SetPoint, TILT_KP, TILT_KI, TILT_KD, DIRECT);
@@ -159,6 +183,10 @@ uint16_t converterAdc(uint16_t adcRead, uint8_t index);
 void     readCalibrationValues(void);
 
 void     readSerialPort(uint8_t actuator);
+
+void     readSafetyPin();
+
+void     readAuxPin();
 
 void setup()
 {
@@ -181,17 +209,62 @@ void setup()
   //turn the PID on
   lift_PID.SetMode(AUTOMATIC);
   tilt_PID.SetMode(AUTOMATIC);
+  
+#if (SAFETY_BAR == ON)
+
+  pinMode(SAFETY_PIN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(SAFETY_PIN), readSafetyPin, CHANGE);
+  Safety_Reference = millis();
+  
+  Safety_State   = (SAFETY_INPUT & (1 << SAFETY_PIN)) ? (ON) : (OFF);
+
+  pinMode(AUX_INPIN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(AUX_INPIN), readAuxPin, RISING);
+  Aux_Reference = millis();
+
+  // Set as OutPut the direction ins of actuators
+  AUX_OUTDIR |= (1 << AUX_OUTPIN);
+  
+  // Set pin foward to high
+  AUX_OUTPORT |=  (1 << AUX_OUTPIN); 
+  
+#endif
 
 #if ((PLOTTE_LIFT == OFF) && (PLOTTE_TILT == OFF))
+
   Serial.println("########## BOBCAT ARDUINO A.H.C/PWM CONTROLLER ##########");
-  Serial.println("---------------------      V2.74      ---------------------");
+  Serial.println("---------------------      V2.75      ---------------------");
+
 #endif
 }
 
 void loop()
 {
-  lift_Loop();
-  tilt_Loop();
+  #if (SAFETY_BAR == ON)
+
+    if (Safety_State == ON)
+    {
+      lift_Loop();
+      tilt_Loop();
+    }
+    else
+    {
+      // Set the setpoints in the middle
+      Tilt_SetPoint = 2000;
+      Lift_SetPoint = 2000;
+      
+      // Disables the actuatores drivers 
+      analogWrite(ACTUATOR_L_SPEED, 0);
+      analogWrite(ACTUATOR_T_SPEED, 0);
+    }
+  
+  #else
+
+    lift_Loop();
+    tilt_Loop();
+  
+  #endif
+
 
   #if (SERIAL_LIFT == ON)
     readSerialPort(LIFT);
@@ -210,25 +283,25 @@ void lift_Loop()
   {
     setDirection(Lift_OutPut, LIFT);
 
+    #if (PLOTTE_TILT == ON)
+      double test = Lift_OutPut;
+    #endif
+
     Lift_OutPut = abs(Lift_OutPut);
 
     // Abaixo de 65 o motor não anda por causa das molas
     analogWrite(ACTUATOR_L_SPEED, Lift_OutPut);  // Set PWM speed value to adjust position
     
     #if (PLOTTE_LIFT == ON)
-        if (abs(Lift_SetPoint - Lift_FeedBack) > 10 )
-        {
           // This is for plotter analysis
           //Serial.print("L_S : "); 
-          //Serial.println(Lift_SetPoint);
-          //Serial.print(" ");
+          Serial.print(Lift_SetPoint);
+          Serial.print(" ");
           //Serial.print("L_F : "); 
-          Serial.println(Lift_FeedBack);
-          //Serial.print(" ");
-          //Serial.print(" ");
+          Serial.print(Lift_FeedBack);
+          Serial.print(" "); 
           //Serial.print("L_O : "); 
-          //Serial.println(Lift_OutPut);
-        }
+          Serial.println(test); 
     #endif
   }
 }
@@ -241,31 +314,31 @@ void tilt_Loop()
   {
     setDirection(Tilt_OutPut, TILT);
 
+    #if (PLOTTE_TILT == ON)
+      double test = Tilt_OutPut;
+    #endif
+
     Tilt_OutPut = abs(Tilt_OutPut);
     
     // Abaixo de 65 o motor não anda por causa das molas
     analogWrite(ACTUATOR_T_SPEED, Tilt_OutPut);  // Set PWM speed value to adjust position
 
     #if (PLOTTE_TILT == ON)
-        if (abs(Tilt_SetPoint - Tilt_FeedBack) > 10 )
-        {
           // This is for plotter analysis
           //Serial.print("T_S : "); 
-          Serial.println(Tilt_SetPoint);
-          //Serial.print(" ");
+          Serial.print(Tilt_SetPoint);
+          Serial.print(" ");
           //Serial.print("T_F : "); 
-          Serial.println(Tilt_FeedBack);
-          //Serial.print(" ");
+          Serial.print(Tilt_FeedBack);
+          Serial.print(" ");
           //Serial.print("T_O : "); 
-          Serial.println(Tilt_OutPut);
-        }
+          Serial.println(test); 
     #endif
   }
 }
 
 void read_LIFT_ADCs(void)
 {
-  // Special condition
   Lift_SetPoint = ReadADC(HANDLE_L);
   Lift_FeedBack = ReadADC(ACTUATOR_L_FB);
 
@@ -308,7 +381,7 @@ inline void setDirection(double error, uint8_t actuator)
     case LIFT:
       {
         // Clear previus pin state to low
-        ACTUATOR_L_PORT &= ~((1 << ACTUATOR_L_BACKWARD_PIN) | (1 << ACTUATOR_L_FORWARD_PIN )) ;
+        ACTUATOR_L_PORT &= ~((1 << ACTUATOR_L_BACKWARD_PIN) | (1 << ACTUATOR_L_FORWARD_PIN ));
 
         if (error >= 0)
         {
@@ -347,12 +420,12 @@ uint16_t converterAdc(uint16_t adcRead, uint8_t index)
 {  
   if (adcRead >= REGISTERS[index + MAX])
   {
-  return 3000;
+  return 3000;  // Higher point value
   }
-
+  
   if (adcRead <= REGISTERS[index + MIN])
   {
-    return 800;
+    return 1000; // Lower point value
   }
 
   if ((adcRead >= REGISTERS[index + MID_TH_LW]) && (adcRead <= REGISTERS[index + MID_TH_HI]))
@@ -394,7 +467,7 @@ void readCalibrationValues(void)
 
   // Read LIFT Actuator calibrations values
   REGISTERS[FDBACK_L_MIN]   = (uint16_t)   EEPROM.read(CALIBRATION_L_FDBACK + CALIBRATION_MIN);
-
+  
   REGISTERS[FDBACK_L_MID]   = (uint16_t)(((EEPROM.read(CALIBRATION_L_FDBACK + CALIBRATION_MID_H)   << 8) & 0xFF00) |
                                          ((EEPROM.read(CALIBRATION_L_FDBACK + CALIBRATION_MID_L)   << 0) & 0x00FF));
 
@@ -437,6 +510,45 @@ void readCalibrationValues(void)
     Serial.print("EEPROM [ "); Serial.print(index); Serial.print(" ] = "); Serial.println(REGISTERS[index]);
   }
 #endif
+}
+
+void readSafetyPin()
+{
+  // Debounce Code
+  if ((millis() - Safety_Reference) >= SAFETY_DEBOUNCE)
+  {
+    // Read safety pin
+    Safety_State   = (SAFETY_INPUT & (1 << SAFETY_PIN)) ? (ON) : (OFF);
+
+    if (((millis() - Safety_Reference) <= SAFETY_TIMEOUT) && (Safety_State == OFF))
+    {
+      Safety_State = ON;
+    }
+  }
+
+  Safety_Reference = millis();
+}
+
+void readAuxPin()
+{
+  // Debounce Code
+  if ((millis() - Aux_Reference) >= SAFETY_DEBOUNCE)
+  {
+    Aux_State = !Aux_State;
+
+    if (Aux_State)
+    {
+        // Clear previus pin state to low
+        AUX_OUTPORT &= ~(1 << AUX_OUTPIN);
+    }
+    else
+    {
+        // Set pin foward to high
+        AUX_OUTPORT |=  (1 << AUX_OUTPIN); 
+    } 
+  }
+
+  Aux_Reference = millis();
 }
 
 void readSerialPort(uint8_t actuator)
